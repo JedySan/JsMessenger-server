@@ -1,0 +1,5 @@
+# создаётся install.sh — секреты и данные сервера
+.env
+data/
+config/
+backups/

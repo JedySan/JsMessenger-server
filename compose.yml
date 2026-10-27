@@ -1,0 +1,142 @@
+# JsMessenger Server — Matrix (Synapse) + звонки LiveKit (MatrixRTC) + Jitsi Meet за Caddy.
+# Значения берутся из .env, его создаёт ./install.sh. Конфиги сервисов — в ./config, данные — в ./data.
+name: jsm
+
+x-restart: &restart
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "5" }
+
+services:
+  # ---------- Matrix ----------
+  postgres:
+    <<: *restart
+    image: ${POSTGRES_IMAGE}
+    environment:
+      POSTGRES_USER: synapse
+      POSTGRES_DB: synapse
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Synapse требует локаль C
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "synapse", "-d", "synapse"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  synapse:
+    <<: *restart
+    image: ${SYNAPSE_IMAGE}
+    environment:
+      SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
+      UID: "991"
+      GID: "991"
+    volumes:
+      - ./data/synapse:/data
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8008/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ---------- звонки в приложении: LiveKit SFU + выдача токенов ----------
+  livekit:
+    <<: *restart
+    image: ${LIVEKIT_IMAGE}
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./config/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "7881:7881/tcp"                  # медиа по TCP, если UDP закрыт
+      - "3478:3478/udp"                  # встроенный TURN
+      - "50100-50200:50100-50200/udp"    # медиа по UDP
+
+  lk-jwt:
+    <<: *restart
+    image: ${LK_JWT_IMAGE}
+    environment:
+      LIVEKIT_URL: wss://${RTC_HOST}/livekit/sfu
+      LIVEKIT_KEY: ${LIVEKIT_KEY}
+      LIVEKIT_SECRET: ${LIVEKIT_SECRET}
+      LIVEKIT_FULL_ACCESS_HOMESERVERS: ${SERVER_NAME}
+      LIVEKIT_JWT_BIND: ":8080"
+    depends_on: [livekit]
+
+  # ---------- HTTPS: сертификаты Let's Encrypt получает и продлевает сам ----------
+  caddy:
+    <<: *restart
+    image: ${CADDY_IMAGE}
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - ./config/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./config/well-known:/srv/.well-known/matrix:ro
+      - ./data/caddy:/data
+    depends_on: [synapse, lk-jwt]
+
+  # ---------- Jitsi Meet (профиль jitsi) ----------
+  jitsi-web:
+    <<: *restart
+    profiles: [jitsi]
+    image: ${JITSI_REPO}/web:${JITSI_VERSION}
+    volumes:
+      - ./data/jitsi/web:/config
+    environment: &jitsi-env
+      TZ: ${TZ:-UTC}
+      PUBLIC_URL: https://${MEET_HOST}
+      DISABLE_HTTPS: "1"
+      ENABLE_HTTP_REDIRECT: "0"
+      ENABLE_LETSENCRYPT: "0"
+      ENABLE_XMPP_WEBSOCKET: "1"
+      ENABLE_AUTH: ${JITSI_AUTH:-0}
+      ENABLE_GUESTS: "1"
+      AUTH_TYPE: internal
+      DEFAULT_LANGUAGE: ${JITSI_LANG:-ru}
+      ENABLE_PREJOIN_PAGE: "1"
+      ENABLE_WELCOME_PAGE: "1"
+      JICOFO_AUTH_PASSWORD: ${JICOFO_AUTH_PASSWORD}
+      JVB_AUTH_PASSWORD: ${JVB_AUTH_PASSWORD}
+      JVB_ADVERTISE_IPS: ${PUBLIC_IP}
+      JVB_PORT: "10000"
+    depends_on: [jitsi-jvb]
+
+  jitsi-prosody:
+    <<: *restart
+    profiles: [jitsi]
+    image: ${JITSI_REPO}/prosody:${JITSI_VERSION}
+    volumes:
+      - ./data/jitsi/prosody/config:/config
+      - ./data/jitsi/prosody/plugins-custom:/prosody-plugins-custom
+      - ./data/jitsi/prosody/storage:/var/lib/prosody
+    environment: *jitsi-env
+    networks:
+      default:
+        aliases: [xmpp.meet.jitsi]
+
+  jitsi-jicofo:
+    <<: *restart
+    profiles: [jitsi]
+    image: ${JITSI_REPO}/jicofo:${JITSI_VERSION}
+    volumes:
+      - ./data/jitsi/jicofo:/config
+    environment: *jitsi-env
+    depends_on: [jitsi-prosody]
+
+  jitsi-jvb:
+    <<: *restart
+    profiles: [jitsi]
+    image: ${JITSI_REPO}/jvb:${JITSI_VERSION}
+    ports:
+      - "10000:10000/udp"
+    volumes:
+      - ./data/jitsi/jvb:/config
+    environment: *jitsi-env
+    depends_on: [jitsi-prosody]
