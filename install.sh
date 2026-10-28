@@ -107,7 +107,8 @@ if [[ $FRESH == 1 && $JITSI == yes ]] || { [[ $FRESH == 0 ]] && jitsi_enabled; }
 say "Проверяю DNS"
 BAD=()
 for h in "${HOSTS[@]}"; do
-  got=$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1; exit}')
+  # нет записи — getent завершается с ошибкой; при pipefail это не должно останавливать установку
+  got=$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1; exit}' || true)
   if [[ $got == "$IP" ]]; then
     info "✓ $h → $got"
   else
@@ -123,21 +124,29 @@ fi
 
 # ---------- 4. порты ----------
 say "Проверяю, свободны ли порты"
-busy() { # порт, протокол → чем занят (пусто, если свободен или это наш docker)
-  local line
-  line=$(ss -Hlnp"$2" "sport = :$1" 2>/dev/null | head -1)
-  [[ -z $line || $line == *docker-proxy* || $line == *dockerd* ]] && return 0
+busy() { # порт, протокол (t|u) → чем занят; пусто, если свободен или занят нашим же комплектом
+  local port=$1 proto=$2 line names
+  line=$(ss -Hlnp"$proto" "sport = :$port" 2>/dev/null | head -1 || true)
+  [[ -z $line ]] && return 0
+  if [[ $line == *docker-proxy* || $line == *dockerd* ]]; then
+    # порт держит Docker: наш ли это контейнер (проект jsm) или чужой
+    names=$(docker ps --filter "publish=$port/$([[ $proto == t ]] && echo tcp || echo udp)" \
+      --format '{{.Label "com.docker.compose.project"}}:{{.Names}}' 2>/dev/null | grep -v '^jsm:' | cut -d: -f2- | paste -sd, - || true)
+    [[ -z $names ]] && return 0
+    printf 'контейнер Docker %s' "$names"
+    return 0
+  fi
   sed -E 's/.*users:\(\("([^"]+)".*/\1/' <<<"$line"
 }
 CONFLICT=0
 for p in 80/t 443/t 7881/t 3478/u 10000/u 50100/u; do
   who=$(busy "${p%/*}" "${p#*/}")
   if [[ -n $who ]]; then
-    warn "Порт ${p%/*}/${p#*/}cp занят: $who"
+    warn "Порт ${p%/*}/$([[ ${p#*/} == t ]] && echo tcp || echo udp) занят: $who"
     CONFLICT=1
   fi
 done
-((CONFLICT == 0)) || die "Освободите порты (например, остановите nginx/apache: systemctl disable --now nginx) и запустите снова"
+((CONFLICT == 0)) || die "Порты заняты другими программами. Комплект рассчитан на отдельный сервер: освободите порты (например, systemctl disable --now nginx) или поставьте его на другую машину"
 info "✓ 80, 443, 7881, 3478/udp, 10000/udp, 50100-50200/udp"
 
 # ---------- 5. .env и конфиги ----------
